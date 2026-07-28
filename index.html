@@ -64,12 +64,11 @@ let statusLoaded=false;
 let MANAGERS = [];
 let isManager = false;
 
-/* ===== 允許打卡的 IP 清單（可依需求自行增減） ===== */
+/* ===== 允許打卡的 IP 清單 ===== */
 const ALLOWED_IPS = [
   "220.134.112.245",  // 範例公司外網 IP 1
   "27.242.70.111"    // 範例公司外網 IP 2
 ];
-
 
 let cachedIP = "";
 let lastRangeStatus = null;
@@ -118,17 +117,56 @@ function updateDateTime(){
 setInterval(updateDateTime,1000);
 updateDateTime();
 
-/* ===== IP 讀取 ===== */
+/* ===== 優化後的 IP 讀取（支援 LocalStorage 快取與背景更新） ===== */
 async function preloadIP(){
-  try{
-    const res=await fetch("https://api.ipify.org?format=json");
-    const data=await res.json();
+  const CACHE_KEY = "user_ip_cache";
+  const TIME_KEY = "user_ip_time";
+  const CACHE_DURATION = 5 * 60 * 1000; // 5分鐘內直接使用快取
+
+  const cachedData = localStorage.getItem(CACHE_KEY);
+  const cacheTime = localStorage.getItem(TIME_KEY);
+  const now = new Date().getTime();
+
+  if (cachedData && cacheTime && (now - cacheTime < CACHE_DURATION)) {
+    cachedIP = cachedData;
+    fetchIPInBackground(CACHE_KEY, TIME_KEY); // 背景靜默更新快取
+    return;
+  }
+
+  await fetchIPWithTimeout(CACHE_KEY, TIME_KEY);
+}
+
+async function fetchIPWithTimeout(cacheKey, timeKey) {
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 3000); // 3秒逾時保護
+
+    const res = await fetch("https://api.ipify.org?format=json", { signal: controller.signal });
+    clearTimeout(timeoutId);
+
+    const data = await res.json();
     cachedIP = data.ip;
-  }catch(err){
-    console.warn("IP 讀取失敗:", err);
-    cachedIP = "";
+
+    localStorage.setItem(cacheKey, cachedIP);
+    localStorage.setItem(timeKey, new Date().getTime());
+  } catch (err) {
+    console.warn("IP 讀取失敗或逾時:", err);
+    cachedIP = localStorage.getItem(cacheKey) || "";
   }
 }
+
+function fetchIPInBackground(cacheKey, timeKey) {
+  fetch("https://api.ipify.org?format=json")
+    .then(res => res.json())
+    .then(data => {
+      if (data && data.ip) {
+        localStorage.setItem(cacheKey, data.ip);
+        localStorage.setItem(timeKey, new Date().getTime());
+      }
+    })
+    .catch(() => {});
+}
+
 function getIP(){
   return cachedIP || "";
 }
@@ -148,7 +186,7 @@ async function initUser(){
   userInfo.textContent = `${userName} 您好`;
 }
 
-/* ===== 狀態（直接前端核對多 IP） ===== */
+/* ===== 狀態 ===== */
 async function updateStatus() {
   if (!cachedIP) {
     statusInfo.textContent = "IP 檢測中…";
@@ -158,7 +196,6 @@ async function updateStatus() {
     return;
   }
 
-  // 檢查目前取得的 IP 是否存在於 ALLOWED_IPS 陣列中
   const isValidIP = ALLOWED_IPS.includes(cachedIP);
   const newStatus = isValidIP ? "有效打卡區" : "無效打卡區";
 
@@ -287,23 +324,21 @@ async function clockInOut(status){
   },1000);
 
   try{
-    // 修改前端 clockInOut 裡的 fetch 區塊：
-const currentIP = getIP();
+    const currentIP = getIP();
+    const gpsData = { lat: 0, lng: 0 }; 
 
-// 假設你目前沒有抓取手機 GPS，可以先帶預設 0 或如果有抓取經緯度則帶入變數
-const gpsData = { lat: 0, lng: 0 }; 
+    const res = await fetch(API_ENDPOINT, {
+      method:"POST",
+      body: JSON.stringify({
+        userId, 
+        userName, 
+        ip: currentIP, 
+        rangeStatus: lastRangeStatus, 
+        status,
+        gps: gpsData
+      })
+    });
 
-const res = await fetch(API_ENDPOINT, {
-  method:"POST",
-  body: JSON.stringify({
-    userId, 
-    userName, 
-    ip: currentIP, 
-    rangeStatus: lastRangeStatus, 
-    status,
-    gps: gpsData  // 🚀 補上這行，讓後端不會因讀取不到 gps.lat 而崩潰
-  })
-});
     const data = await res.json();
     const actuallyUpdated = data.message && (data.message.includes("已更新") || data.message.includes("成功"));
 
@@ -344,14 +379,14 @@ document.getElementById("btnApprove").onclick = () => {
   window.location.href = "https://script.google.com/macros/s/AKfycbwe5O6ktoaMPNsbT-U8kyruMisF4pd9ezoEsW07ofMP4wKzj4veHhjsc9-cmeddUU9mgQ/exec";
 };
 
-/* ===== 載入 ===== */
+/* ===== 載入（並行非同步優化） ===== */
 window.onload = async () => {
   statusInfo.textContent = "正在檢查網路與 IP...";
   statusInfo.style.background = "#95a5a6";
   setButtonsLock(true, "同步中...", "同步中...");
 
-  // 先行讀取 IP
-  await preloadIP();
+  // 🔥 讓 IP 查詢與 LIFF 初始化同時並行出發，大幅縮短等待時間
+  const ipPromise = preloadIP();
 
   try {
     await initUser();
@@ -362,7 +397,10 @@ window.onload = async () => {
       loadManagers()
     ]);
     
-    // 直接核對 IP 狀態
+    // 等待 IP 檢查完成
+    await ipPromise;
+    
+    // 核對 IP 狀態並解鎖按鈕
     updateStatus();
 
   } catch (error) {
